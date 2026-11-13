@@ -1,12 +1,19 @@
-import json
-import hashlib
+from io import BytesIO
 from pathlib import Path
 
-from .models import Character
+import hashlib
+import json
+
+from PIL import Image
+
+from .models import Character, ReferenceImage
 
 
 class CharacterRepository:
-    """只读加载管理员维护的本地角色库。"""
+    """加载并维护管理员确认的本地角色档案和参考图。"""
+
+    MAX_REFERENCE_IMAGE_BYTES = 20 * 1024 * 1024
+    MAX_REFERENCE_IMAGE_PIXELS = 40_000_000
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -28,6 +35,7 @@ class CharacterRepository:
             name = str(entry.get("name") or "").strip()
             aliases = entry.get("aliases") or []
             appearance_cards = entry.get("appearance_cards") or []
+            references = entry.get("reference_images")
             if not character_id or not name or not isinstance(aliases, list) or not isinstance(appearance_cards, list):
                 continue
             characters.append(
@@ -37,6 +45,11 @@ class CharacterRepository:
                     aliases=tuple(str(item).strip() for item in aliases if str(item).strip()),
                     relationship=str(entry.get("relationship") or "").strip(),
                     appearance_cards=tuple(str(item).strip() for item in appearance_cards if str(item).strip()),
+                    reference_images=tuple(
+                        reference
+                        for item in (references if isinstance(references, list) else [])
+                        if (reference := ReferenceImage.from_dict(item)) is not None
+                    ),
                 )
             )
         self._characters = tuple(characters)
@@ -73,7 +86,15 @@ class CharacterRepository:
                 return character
         return None
 
-    def upsert(self, *, name: str, relationship: str, appearance_cards: list[str]) -> Character:
+    def upsert(
+        self,
+        *,
+        name: str,
+        relationship: str,
+        appearance_cards: list[str],
+        image_bytes: bytes | None = None,
+        variant: str = "standard",
+    ) -> Character:
         """写入管理员确认的新角色，名称相同则覆盖其外观卡。"""
 
         normalized_name = name.strip()
@@ -105,7 +126,8 @@ class CharacterRepository:
         # Names are commonly Chinese, so an ASCII-only slug would collapse every such
         # entry to the same ID. The digest is stable and collision-resistant in practice.
         identifier = str((existing_entry or {}).get("id") or "").strip() or f"char-{hashlib.sha256(normalized_name.casefold().encode('utf-8')).hexdigest()[:12]}"
-        entries.append(
+        entry = dict(existing_entry or {})
+        entry.update(
             {
                 "id": identifier,
                 "name": normalized_name,
@@ -114,6 +136,9 @@ class CharacterRepository:
                 "appearance_cards": cards[:5],
             }
         )
+        if image_bytes is not None:
+            self._append_reference(entry, self._persist_reference_image(identifier, image_bytes, variant))
+        entries.append(entry)
         raw["characters"] = entries
         self._write(raw)
         self.reload()
@@ -122,7 +147,15 @@ class CharacterRepository:
             raise RuntimeError("角色库写入后未找到新角色")
         return character
 
-    def append_appearance_cards(self, *, name: str, appearance_cards: list[str], limit: int = 15) -> Character:
+    def append_appearance_cards(
+        self,
+        *,
+        name: str,
+        appearance_cards: list[str],
+        limit: int = 15,
+        image_bytes: bytes | None = None,
+        variant: str = "standard",
+    ) -> Character:
         """合并管理员从已发图片确认的补充外观卡，保留既有身份和关系。"""
 
         normalized_name = name.strip()
@@ -155,12 +188,95 @@ class CharacterRepository:
                 seen.add(key)
                 merged.append(normalized_card)
         target["appearance_cards"] = merged[-limit:]
+        if image_bytes is not None:
+            self._append_reference(
+                target,
+                self._persist_reference_image(str(target.get("id") or ""), image_bytes, variant),
+            )
         self._write(raw)
         self.reload()
         character = self.find_name(normalized_name)
         if character is None:
             raise RuntimeError("角色库修正后未找到角色")
         return character
+
+    @classmethod
+    def _reference_extension(cls, image_bytes: bytes) -> str:
+        """拒绝非图片、损坏图和超限图，不修改管理员给出的原图。"""
+        if not image_bytes or len(image_bytes) > cls.MAX_REFERENCE_IMAGE_BYTES:
+            raise ValueError("参考图不能为空且不能超过 20 MiB")
+        with Image.open(BytesIO(image_bytes)) as image:
+            extension = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}.get(image.format or "")
+            if extension is None:
+                raise ValueError("生图参考图仅支持 PNG、JPEG 或 WebP；GIF 请先导出一帧")
+            if image.width * image.height > cls.MAX_REFERENCE_IMAGE_PIXELS:
+                raise ValueError("参考图像素数超过限制")
+            image.verify()
+        with Image.open(BytesIO(image_bytes)) as image:
+            image.load()
+        return extension
+
+    def _reference_path(self, relative_file: str) -> Path:
+        data_root = self._path.parent.resolve()
+        root = (data_root / "reference_images").resolve()
+        if not root.is_relative_to(data_root):
+            raise ValueError("参考图目录不能指向角色库数据目录以外")
+        relative = Path(relative_file)
+        path = (data_root / relative).resolve()
+        if relative.is_absolute() or not path.is_relative_to(root) or path == root:
+            raise ValueError("参考图必须位于角色库的 reference_images 目录内")
+        return path
+
+    def _persist_reference_image(self, character_id: str, image_bytes: bytes, variant: str) -> ReferenceImage:
+        extension = self._reference_extension(image_bytes)
+        if not character_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in character_id):
+            raise ValueError("角色 ID 不能用于参考图目录")
+        normalized_variant = variant.strip() or "standard"
+        if len(normalized_variant) > 64 or any(ord(char) < 32 for char in normalized_variant):
+            raise ValueError("参考图变体标签无效")
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        reference = ReferenceImage(
+            file=f"reference_images/{character_id}/{digest}.{extension}",
+            variant=normalized_variant,
+            sha256=digest,
+        )
+        path = self._reference_path(reference.file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_bytes(image_bytes)
+            temporary.replace(path)
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError("已有参考图内容与文件哈希不符")
+        return reference
+
+    @staticmethod
+    def _append_reference(entry: dict[str, object], reference: ReferenceImage) -> None:
+        existing = entry.get("reference_images")
+        values = list(existing) if isinstance(existing, list) else []
+        if not any(isinstance(item, dict) and item.get("sha256") == reference.sha256 for item in values):
+            values.append(reference.to_dict())
+        entry["reference_images"] = values
+
+    def store_reference_image(self, *, name: str, image_bytes: bytes, variant: str = "standard") -> ReferenceImage:
+        """为已有角色保存原始参考图，同内容只保存一次。"""
+        character = self.find_name(name)
+        if character is None:
+            raise ValueError(f"角色库中不存在“{name}”")
+        reference = self._persist_reference_image(character.character_id, image_bytes, variant)
+        self._update_entry(name=character.name, update=lambda entry: self._append_reference(entry, reference))
+        return reference
+
+    def read_reference_image(self, reference: ReferenceImage) -> bytes:
+        """校验归属、大小和哈希后读取参考图，禁止读取库外文件。"""
+        path = self._reference_path(reference.file)
+        if path.stat().st_size > self.MAX_REFERENCE_IMAGE_BYTES:
+            raise ValueError("参考图超过 20 MiB")
+        image_bytes = path.read_bytes()
+        if hashlib.sha256(image_bytes).hexdigest() != reference.sha256:
+            raise ValueError("参考图内容与登记哈希不符")
+        self._reference_extension(image_bytes)
+        return image_bytes
 
     def list_characters(self) -> tuple[Character, ...]:
         return self._characters

@@ -1,12 +1,18 @@
-import asyncio
-import base64
-import json
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import asyncio
+import base64
+import json
+import logging
+import time
+
 from .models import VisionResult
 from .reverse_image import prepare_anime_trace_image
+
+logger = logging.getLogger(__name__)
+VisionUsageCallback = Callable[[str, str, dict[str, Any] | None, float], Awaitable[None]]
 
 
 HOST_IMAGE_DESCRIPTION_PROMPT = (
@@ -59,8 +65,12 @@ def build_prompt(private_catalog: list[dict[str, object]], max_candidates: int =
     return (
         "识别图片中的主要人物角色。只输出 JSON，不要 Markdown。\n"
         "格式：{\"description\":\"不超过100字的客观中文图片描述\",\"is_anime_character\":true,\"candidates\":["
-        "{\"kind\":\"private|unknown\",\"name\":\"\",\"franchise\":\"\",\"evidence\":[\"最多3条可见特征\"],\"conflicts\":[\"冲突特征\"]}]}。\n"
+        "{\"kind\":\"private|unknown\",\"name\":\"\",\"franchise\":\"\",\"location\":\"所在分格和画面位置\",\"evidence\":[\"最多3条可见特征\"],\"conflicts\":[\"冲突特征\"]}]}。\n"
         f"每个可区分人物对应一个候选，最多{max_candidates}个；private 只能从本地角色库中逐字选择 name；看不清、没有人物或没有足够证据时使用空 candidates。"
+        "location 必须标明该人物所在的分格和位置，例如‘第一格左上方树上的人物’；单幅图也要写清左侧、中央、右下等可见位置。"
+        "evidence 要写这个人物的发色、头饰、服装等可见外观，不要描述剧情或代替后续模型理解画面。"
+        "原图会直接提供给后续模型，你只负责辅助身份对应；不要仅按名单或画面顺序猜对应关系。"
+        "同一角色在不同分格重复出现时，分别给出各自位置，不要把不同人物的外观证据混合。\n"
         "不要凭模型记忆猜公共角色名，不要把风格或相似度当成证据；不在本地角色库中的人物必须使用 unknown。\n"
         "输出额外字段 is_anime_character：仅当图片主体是二次元、动画或游戏风格人物时为 true；真人、风景、物品、文字梗图和非人物图片必须为 false。\n"
         f"本地角色库：{catalog}"
@@ -78,13 +88,18 @@ async def identify_image(
     timeout_seconds: int,
     max_upload_bytes: int = 4_194_304,
     max_candidates: int = 3,
+    reasoning_effort: str = "",
+    usage_callback: VisionUsageCallback | None = None,
 ) -> VisionResult | None:
     image_bytes, _ = prepare_anime_trace_image(image_bytes, max_bytes=max_upload_bytes)
     prompt = build_prompt(private_catalog, max_candidates)
     if provider == "gemini":
         content = await _call_gemini(api_key, base_url, model, prompt, image_bytes, timeout_seconds)
     elif provider == "openai":
-        content = await _call_openai(api_key, base_url, model, prompt, image_bytes, timeout_seconds)
+        content = await _call_openai(
+            api_key, base_url, model, prompt, image_bytes, timeout_seconds,
+            reasoning_effort=reasoning_effort, usage_callback=usage_callback,
+        )
     else:
         raise ValueError(f"不支持的视觉提供方: {provider}")
     try:
@@ -102,6 +117,8 @@ async def build_appearance_cards(
     image_bytes: bytes,
     timeout_seconds: int,
     max_upload_bytes: int = 4_194_304,
+    reasoning_effort: str = "",
+    usage_callback: VisionUsageCallback | None = None,
 ) -> list[str]:
     image_bytes, _ = prepare_anime_trace_image(image_bytes, max_bytes=max_upload_bytes)
     prompt = (
@@ -112,7 +129,10 @@ async def build_appearance_cards(
     if provider == "gemini":
         content = await _call_gemini(api_key, base_url, model, prompt, image_bytes, timeout_seconds)
     elif provider == "openai":
-        content = await _call_openai(api_key, base_url, model, prompt, image_bytes, timeout_seconds)
+        content = await _call_openai(
+            api_key, base_url, model, prompt, image_bytes, timeout_seconds,
+            reasoning_effort=reasoning_effort, usage_callback=usage_callback,
+        )
     else:
         raise ValueError(f"不支持的视觉提供方: {provider}")
     parsed = json.loads(_extract_json(content))
@@ -126,11 +146,12 @@ async def build_appearance_cards(
 
 
 async def _call_openai(
-    api_key: str, base_url: str, model: str, prompt: str, image_bytes: bytes, timeout_seconds: int
+    api_key: str, base_url: str, model: str, prompt: str, image_bytes: bytes, timeout_seconds: int,
+    *, reasoning_effort: str = "", usage_callback: VisionUsageCallback | None = None,
 ) -> str:
     mime_type = detect_image_mime_type(image_bytes)
     data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "temperature": 0,
         "max_tokens": 650,
@@ -145,8 +166,26 @@ async def _call_openai(
             }
         ],
     }
+    if reasoning_effort and reasoning_effort != "auto":
+        payload["reasoning_effort"] = reasoning_effort
+        if reasoning_effort != "none":
+            # 推理预算同时覆盖思考和 JSON 输出，且这些模型不能同时指定 temperature。
+            payload.pop("temperature")
+            payload["max_tokens"] = 8192
     url = base_url.rstrip("/") + "/chat/completions"
+    started_at = time.perf_counter()
     response = await _post_json(url, {"Authorization": f"Bearer {api_key}"}, payload, timeout_seconds)
+    if usage_callback is not None:
+        raw_usage = response.get("usage") if isinstance(response, dict) else None
+        try:
+            # 成功返回即已使用额度；即使模型内容无法解析，也要保留供应商给出的 usage。
+            await usage_callback(
+                model, base_url, raw_usage if isinstance(raw_usage, dict) else None,
+                time.perf_counter() - started_at,
+            )
+        except Exception as exc:
+            # 记账错误不能让已成功的请求被重试；不记录输入、响应全文或密钥。
+            logger.warning("Character vision usage recording failed (%s).", type(exc).__name__)
     choices = response.get("choices") if isinstance(response, dict) else None
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise ValueError("OpenAI 兼容接口未返回 choices")

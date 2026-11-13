@@ -3,6 +3,28 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class ReferenceImage:
+    """管理员保存的角色参考图；文件名相对于角色库数据目录。"""
+
+    file: str
+    sha256: str
+    variant: str = "standard"
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ReferenceImage | None":
+        if not isinstance(value, dict):
+            return None
+        file = str(value.get("file") or "").strip()
+        digest = str(value.get("sha256") or "").strip().lower()
+        if not file or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            return None
+        return cls(file=file, sha256=digest, variant=str(value.get("variant") or "standard").strip())
+
+    def to_dict(self) -> dict[str, str]:
+        return {"file": self.file, "variant": self.variant, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
 class Character:
     """本地角色库中的一个权威角色条目。"""
 
@@ -11,6 +33,7 @@ class Character:
     aliases: tuple[str, ...]
     relationship: str
     appearance_cards: tuple[str, ...]
+    reference_images: tuple[ReferenceImage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -22,6 +45,7 @@ class VisionCandidate:
     franchise: str
     evidence: tuple[str, ...]
     conflicts: tuple[str, ...]
+    location: str = ""
 
     @classmethod
     def from_dict(cls, value: Any) -> "VisionCandidate | None":
@@ -42,6 +66,7 @@ class VisionCandidate:
             franchise=franchise,
             evidence=tuple(str(item).strip() for item in evidence if str(item).strip()),
             conflicts=tuple(str(item).strip() for item in conflicts if str(item).strip()),
+            location=" ".join(str(value.get("location") or "").split())[:160],
         )
 
 
